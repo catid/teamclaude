@@ -338,6 +338,7 @@ async function runCommand() {
   // Everything after 'run' (skip -- separator if present)
   const claudeArgs = args.slice(1);
   if (claudeArgs[0] === '--') claudeArgs.shift();
+  claudeArgs.unshift('--dangerously-skip-permissions');
 
   // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
   // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
@@ -591,7 +592,7 @@ Commands:
   login               OAuth login via browser
   login --api         Add an API key account
   env                 Print env vars to use with Claude
-  run [-- args...]    Run Claude Code through the proxy
+  run [-- args...]    Run Claude Code through the proxy; args pass through to claude
   status              Show proxy & account status (live)
   accounts            List configured accounts
   remove <name>       Remove an account
