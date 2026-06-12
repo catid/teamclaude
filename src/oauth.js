@@ -141,8 +141,9 @@ export async function fetchProfile(accessToken) {
 
 // OAuth config (extracted from Claude Code)
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-const OAUTH_AUTHORIZE = 'https://claude.ai/oauth/authorize';
+const OAUTH_AUTHORIZE = 'https://claude.com/cai/oauth/authorize';
 const OAUTH_TOKEN = 'https://platform.claude.com/v1/oauth/token';
+const OAUTH_MANUAL_REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback';
 const OAUTH_SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
 
 /**
@@ -157,28 +158,21 @@ export async function loginOAuth() {
 
   // Start local callback server on a random port
   const { port, codePromise, server } = await startCallbackServer(state);
-  const redirectUri = `http://localhost:${port}/callback`;
+  const automaticRedirectUri = `http://localhost:${port}/callback`;
 
   // Build authorization URL
-  const authUrl = new URL(OAUTH_AUTHORIZE);
-  authUrl.searchParams.set('code', 'true');
-  authUrl.searchParams.set('client_id', OAUTH_CLIENT_ID);
-  authUrl.searchParams.set('response_type', 'code');
-  authUrl.searchParams.set('redirect_uri', redirectUri);
-  authUrl.searchParams.set('scope', OAUTH_SCOPES);
-  authUrl.searchParams.set('code_challenge', codeChallenge);
-  authUrl.searchParams.set('code_challenge_method', 'S256');
-  authUrl.searchParams.set('state', state);
+  const automaticAuthUrl = buildAuthUrl({ redirectUri: automaticRedirectUri, codeChallenge, state });
+  const manualAuthUrl = buildAuthUrl({ redirectUri: OAUTH_MANUAL_REDIRECT_URI, codeChallenge, state });
 
   // Open browser
   console.log('Opening browser for authentication...');
-  console.log(`If it doesn't open, visit:\n  ${authUrl.toString()}\n`);
-  openBrowser(authUrl.toString());
+  console.log(`If it doesn't open, visit this URL on any machine:\n  ${manualAuthUrl.toString()}\n`);
+  openBrowser(automaticAuthUrl.toString());
 
   // Wait for either the callback server or manual paste from stdin
-  let code;
+  let authResult;
   try {
-    code = await raceWithStdinCode(codePromise, state);
+    authResult = await raceWithStdinCode(codePromise, state);
   } finally {
     server.close();
   }
@@ -189,11 +183,11 @@ export async function loginOAuth() {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      code,
+      code: authResult.code,
       state,
       grant_type: 'authorization_code',
       client_id: OAUTH_CLIENT_ID,
-      redirect_uri: redirectUri,
+      redirect_uri: authResult.redirectUri,
       code_verifier: codeVerifier,
     }),
   });
@@ -209,6 +203,19 @@ export async function loginOAuth() {
     refreshToken: tokens.refresh_token,
     expiresAt: normalizeExpiresAt(tokens.expires_at) || (Date.now() + (tokens.expires_in || 3600) * 1000),
   };
+}
+
+function buildAuthUrl({ redirectUri, codeChallenge, state }) {
+  const authUrl = new URL(OAUTH_AUTHORIZE);
+  authUrl.searchParams.set('code', 'true');
+  authUrl.searchParams.set('client_id', OAUTH_CLIENT_ID);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('scope', OAUTH_SCOPES);
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
+  authUrl.searchParams.set('state', state);
+  return authUrl;
 }
 
 /**
@@ -230,26 +237,13 @@ function raceWithStdinCode(callbackPromise, expectedState) {
     };
 
     rl.question('Paste authorization code here (or wait for browser callback): ', answer => {
-      const trimmed = answer.trim();
-      if (!trimmed) return; // empty input, keep waiting for callback
-
-      // Try to parse as a URL with ?code= parameter
       try {
-        const url = new URL(trimmed);
-        const code = url.searchParams.get('code');
-        const state = url.searchParams.get('state');
-        if (code) {
-          if (expectedState && state && state !== expectedState) {
-            settle(reject, new Error('OAuth state mismatch'));
-          } else {
-            settle(resolve, code);
-          }
-          return;
-        }
-      } catch {}
-
-      // Treat raw input as the authorization code
-      settle(resolve, trimmed);
+        const result = parseManualAuthInput(answer, expectedState);
+        if (!result) return; // empty input, keep waiting for callback
+        settle(resolve, result);
+      } catch (err) {
+        settle(reject, err);
+      }
     });
 
     callbackPromise.then(
@@ -257,6 +251,51 @@ function raceWithStdinCode(callbackPromise, expectedState) {
       err => settle(reject, err),
     );
   });
+}
+
+function parseManualAuthInput(input, expectedState) {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  try {
+    const url = new URL(trimmed);
+    const query = new URLSearchParams(url.search);
+    const fragment = new URLSearchParams(url.hash.startsWith('#') ? url.hash.slice(1) : url.hash);
+    const code = query.get('code') || fragment.get('code');
+    const state = query.get('state') || fragment.get('state');
+    if (code) {
+      assertOAuthState(state, expectedState);
+      return {
+        code,
+        redirectUri: `${url.origin}${url.pathname}`,
+      };
+    }
+  } catch {}
+
+  if (trimmed.includes('=') && trimmed.includes('&')) {
+    const params = new URLSearchParams(trimmed);
+    const code = params.get('code');
+    if (code) {
+      assertOAuthState(params.get('state'), expectedState);
+      return { code, redirectUri: OAUTH_MANUAL_REDIRECT_URI };
+    }
+  }
+
+  const hashIndex = trimmed.lastIndexOf('#');
+  if (hashIndex > 0) {
+    const code = trimmed.slice(0, hashIndex);
+    const state = trimmed.slice(hashIndex + 1);
+    assertOAuthState(state, expectedState);
+    return { code, redirectUri: OAUTH_MANUAL_REDIRECT_URI };
+  }
+
+  return { code: trimmed, redirectUri: OAUTH_MANUAL_REDIRECT_URI };
+}
+
+function assertOAuthState(actualState, expectedState) {
+  if (expectedState && actualState && actualState !== expectedState) {
+    throw new Error('OAuth state mismatch');
+  }
 }
 
 function startCallbackServer(expectedState) {
@@ -289,7 +328,10 @@ function startCallbackServer(expectedState) {
         if (code) {
           res.writeHead(302, { 'Location': 'https://platform.claude.com/oauth/code/success?app=claude-code' });
           res.end();
-          resolveCode(code);
+          resolveCode({
+            code,
+            redirectUri: `http://localhost:${server.address().port}/callback`,
+          });
           return;
         }
       }
