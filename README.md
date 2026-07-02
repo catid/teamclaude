@@ -115,16 +115,10 @@ In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `E
 teamclaude run
 ```
 
-`run` passes proxy credentials to Claude Code so it uses the account selected by
-TeamClaude instead of asking for a separate Claude Code login. It also starts
-Claude Code in full-auto mode by default by disabling the sandbox with
-`--settings '{"sandbox":{"enabled":false}}'` and disabling permission prompts
-with `--permission-mode bypassPermissions`. Override either default by passing
-your own flag:
+`teamclaude run` always starts Claude Code with `--dangerously-skip-permissions`. Extra arguments pass through to Claude Code, so resume works normally:
 
 ```bash
-teamclaude run -- --permission-mode default
-teamclaude run -- --settings '{"sandbox":{"enabled":true}}'
+teamclaude run -c
 ```
 
 Or manually set the environment:

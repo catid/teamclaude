@@ -10,7 +10,6 @@ import { TUI } from './tui.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
-const DEFAULT_RUN_SETTINGS = JSON.stringify({ sandbox: { enabled: false } });
 
 switch (command) {
   case 'server':
@@ -328,7 +327,6 @@ async function loginOAuthCommand() {
 async function envCommand() {
   const config = await loadOrCreateConfig();
   console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
-  console.log(`export ANTHROPIC_AUTH_TOKEN=${config.proxy.apiKey}`);
   console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
 }
 
@@ -340,21 +338,17 @@ async function runCommand() {
   // Everything after 'run' (skip -- separator if present)
   const claudeArgs = args.slice(1);
   if (claudeArgs[0] === '--') claudeArgs.shift();
-  const effectiveClaudeArgs = withDefaultFullAutoArgs(claudeArgs);
+  claudeArgs.unshift('--dangerously-skip-permissions');
 
-  // Use the proxy key as a local Claude Code credential shim. The proxy still
-  // replaces client auth with the selected TeamClaude account before upstream.
-  const proxyUrl = `http://localhost:${config.proxy.port}`;
-  const proxyKey = config.proxy.apiKey;
-
+  // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
+  // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
+  // lets Claude Code stay in subscription mode (full model access).
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
-  const result = spawnSync('claude', effectiveClaudeArgs, {
+  const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
     env: {
       ...process.env,
-      ANTHROPIC_BASE_URL: proxyUrl,
-      ANTHROPIC_AUTH_TOKEN: proxyKey,
-      ANTHROPIC_API_KEY: proxyKey,
+      ANTHROPIC_BASE_URL: `http://localhost:${config.proxy.port}`,
     },
   });
 
@@ -598,7 +592,7 @@ Commands:
   login               OAuth login via browser
   login --api         Add an API key account
   env                 Print env vars to use with Claude
-  run [-- args...]    Run Claude Code through the proxy
+  run [-- args...]    Run Claude Code through the proxy; args pass through to claude
   status              Show proxy & account status (live)
   accounts            List configured accounts
   remove <name>       Remove an account
@@ -611,12 +605,6 @@ Options:
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
-
-Run defaults:
-  teamclaude run passes proxy credentials to Claude Code, disables the sandbox
-  with --settings '${DEFAULT_RUN_SETTINGS}', and starts with
-  --permission-mode bypassPermissions unless you pass those flags yourself.
-  Override permissions with: teamclaude run -- --permission-mode default
 
 Config: ${getConfigPath()}
 `);
@@ -777,31 +765,4 @@ async function resolveAccounts(config) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
-}
-
-function withDefaultFullAutoArgs(claudeArgs) {
-  const defaultArgs = [];
-  if (!hasSettingsArg(claudeArgs)) {
-    defaultArgs.push('--settings', DEFAULT_RUN_SETTINGS);
-  }
-  if (!hasPermissionModeArg(claudeArgs)) {
-    defaultArgs.push('--permission-mode', 'bypassPermissions');
-  }
-  return [...defaultArgs, ...claudeArgs];
-}
-
-function hasPermissionModeArg(claudeArgs) {
-  return claudeArgs.some(arg =>
-    arg === '--permission-mode' ||
-    arg.startsWith('--permission-mode=') ||
-    arg === '--dangerously-skip-permissions' ||
-    arg === '--allow-dangerously-skip-permissions'
-  );
-}
-
-function hasSettingsArg(claudeArgs) {
-  return claudeArgs.some(arg =>
-    arg === '--settings' ||
-    arg.startsWith('--settings=')
-  );
 }
