@@ -10,6 +10,7 @@ import { TUI } from './tui.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
+const DEFAULT_RUN_SETTINGS = JSON.stringify({ sandbox: { enabled: false } });
 
 switch (command) {
   case 'server':
@@ -327,6 +328,7 @@ async function loginOAuthCommand() {
 async function envCommand() {
   const config = await loadOrCreateConfig();
   console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
+  console.log(`export ANTHROPIC_AUTH_TOKEN=${config.proxy.apiKey}`);
   console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
 }
 
@@ -338,17 +340,23 @@ async function runCommand() {
   // Everything after 'run' (skip -- separator if present)
   const claudeArgs = args.slice(1);
   if (claudeArgs[0] === '--') claudeArgs.shift();
+  if (!hasSettingsArg(claudeArgs)) {
+    claudeArgs.unshift('--settings', DEFAULT_RUN_SETTINGS);
+  }
   claudeArgs.unshift('--dangerously-skip-permissions');
 
-  // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
-  // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
-  // lets Claude Code stay in subscription mode (full model access).
+  // Use the proxy key as a local Claude Code credential shim. The proxy still
+  // replaces client auth with the selected TeamClaude account before upstream.
+  const proxyUrl = `http://localhost:${config.proxy.port}`;
+  const proxyKey = config.proxy.apiKey;
+
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
   const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
     env: {
       ...process.env,
-      ANTHROPIC_BASE_URL: `http://localhost:${config.proxy.port}`,
+      ANTHROPIC_BASE_URL: proxyUrl,
+      ANTHROPIC_AUTH_TOKEN: proxyKey,
     },
   });
 
@@ -765,4 +773,11 @@ async function resolveAccounts(config) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
+}
+
+function hasSettingsArg(claudeArgs) {
+  return claudeArgs.some(arg =>
+    arg === '--settings' ||
+    arg.startsWith('--settings=')
+  );
 }
