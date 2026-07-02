@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
-import { copyFile, mkdir, readdir, symlink, writeFile, lstat, chmod } from 'node:fs/promises';
+import { copyFile, mkdir, readdir, symlink, writeFile, lstat, chmod, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -57,6 +57,12 @@ switch (command) {
     break;
   case 'accounts':
     await accountsCommand();
+    process.exit(0);
+    break;
+  case 'clear-logins':
+  case 'clear-accounts':
+  case 'logout':
+    await clearLoginsCommand();
     process.exit(0);
     break;
   case 'remove':
@@ -550,15 +556,19 @@ function summarizeRefreshError(err) {
 }
 
 async function prepareClaudeCodeConfigDir() {
-  const configRoot = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
-  const configDir = process.env.TEAMCLAUDE_CLAUDE_CONFIG_DIR
-    || join(configRoot, 'teamclaude', 'claude-code');
+  const configDir = getClaudeCodeConfigDir();
   await mkdir(configDir, { recursive: true, mode: 0o700 });
   await chmod(configDir, 0o700).catch(() => {});
 
   await seedClaudeJson(configDir);
   await symlinkClaudeConfigEntries(configDir);
   return configDir;
+}
+
+function getClaudeCodeConfigDir() {
+  const configRoot = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+  return process.env.TEAMCLAUDE_CLAUDE_CONFIG_DIR
+    || join(configRoot, 'teamclaude', 'claude-code');
 }
 
 async function seedClaudeJson(configDir) {
@@ -820,6 +830,20 @@ async function apiCommand() {
 
 // ── remove ──────────────────────────────────────────────────
 
+async function clearLoginsCommand() {
+  const config = await loadOrCreateConfig();
+  const removed = config.accounts.length;
+  config.accounts = [];
+  await saveConfig(config);
+
+  const credentialsPath = join(getClaudeCodeConfigDir(), '.credentials.json');
+  await rm(credentialsPath, { force: true });
+
+  console.log(`Removed ${removed} account(s).`);
+  console.log(`Cleared TeamClaude Claude Code credentials: ${credentialsPath}`);
+  console.log('Restart teamclaude-server for the running proxy to forget accounts.');
+}
+
 async function removeCommand() {
   const config = await loadOrCreateConfig();
   const name = args[1];
@@ -856,6 +880,7 @@ Commands:
   run [-- args...]    Run Claude Code through the proxy; args pass through to claude
   status              Show proxy & account status (live)
   accounts            List configured accounts
+  clear-logins        Remove all configured accounts (aliases: clear-accounts, logout)
   remove <name>       Remove an account
   api <path>          Call an API endpoint with account credentials
   help                Show this help

@@ -136,10 +136,13 @@ claude
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude accounts -v       # Also show token expiry times
 teamclaude status            # Show live proxy status (requires running server)
+teamclaude clear-logins      # Remove all configured accounts
 teamclaude remove <name>     # Remove an account
 teamclaude api <path>        # Call an API endpoint with account credentials
 teamclaude help              # Show all commands
 ```
+
+After `teamclaude clear-logins`, restart `teamclaude-server` so the running proxy forgets in-memory accounts.
 
 ### Request logging
 
