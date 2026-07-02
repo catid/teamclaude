@@ -357,6 +357,7 @@ async function runCommand() {
       ...process.env,
       ANTHROPIC_BASE_URL: proxyUrl,
       ANTHROPIC_AUTH_TOKEN: proxyKey,
+      ANTHROPIC_API_KEY: proxyKey,
     },
   });
 
