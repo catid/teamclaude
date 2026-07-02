@@ -329,7 +329,7 @@ async function envCommand() {
   const config = await loadOrCreateConfig();
   console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
   console.log(`export ANTHROPIC_AUTH_TOKEN=${config.proxy.apiKey}`);
-  console.log(`export ANTHROPIC_API_KEY=${config.proxy.apiKey}`);
+  console.log('unset ANTHROPIC_API_KEY');
 }
 
 // ── run ─────────────────────────────────────────────────────
@@ -349,16 +349,17 @@ async function runCommand() {
   // replaces client auth with the selected TeamClaude account before upstream.
   const proxyUrl = `http://localhost:${config.proxy.port}`;
   const proxyKey = config.proxy.apiKey;
+  const claudeEnv = {
+    ...process.env,
+    ANTHROPIC_BASE_URL: proxyUrl,
+    ANTHROPIC_AUTH_TOKEN: proxyKey,
+  };
+  delete claudeEnv.ANTHROPIC_API_KEY;
 
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
   const result = spawnSync('claude', claudeArgs, {
     stdio: 'inherit',
-    env: {
-      ...process.env,
-      ANTHROPIC_BASE_URL: proxyUrl,
-      ANTHROPIC_AUTH_TOKEN: proxyKey,
-      ANTHROPIC_API_KEY: proxyKey,
-    },
+    env: claudeEnv,
   });
 
   if (result.error) {
