@@ -20,11 +20,14 @@ export function createProxyServer(accountManager, config, hooks = {}) {
 
   const server = http.createServer(async (req, res) => {
     try {
-      // Auth check — skip for localhost connections
-      const clientKey = req.headers['x-api-key'];
+      // Auth check — skip for localhost connections. Claude Code uses
+      // Authorization for env OAuth tokens and x-api-key for env API keys.
+      const clientKey = firstHeader(req.headers['x-api-key']);
+      const bearerToken = getBearerToken(firstHeader(req.headers.authorization));
       const remoteAddr = req.socket.remoteAddress;
       const isLocal = remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1';
-      if (proxyApiKey && clientKey !== proxyApiKey && !isLocal) {
+      const hasProxyAuth = clientKey === proxyApiKey || bearerToken === proxyApiKey;
+      if (proxyApiKey && !hasProxyAuth && !isLocal) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           type: 'error',
@@ -188,6 +191,7 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     const lk = key.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lk)) continue;
     if (lk === 'x-api-key') continue;
+    if (lk === 'authorization') continue;
     // Strip accept-encoding: Node fetch auto-decompresses, which would
     // mismatch the Content-Encoding header we forward to the client
     if (lk === 'accept-encoding') continue;
@@ -342,6 +346,16 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
       }));
     }
   }
+}
+
+function firstHeader(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function getBearerToken(value) {
+  if (!value) return null;
+  const match = /^Bearer\s+(.+)$/i.exec(value.trim());
+  return match?.[1] || null;
 }
 
 /**
