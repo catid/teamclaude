@@ -115,7 +115,7 @@ In selection mode, use `j`/`k` or arrow keys to navigate, `Enter` to confirm, `E
 teamclaude run
 ```
 
-`teamclaude run` passes proxy bearer credentials to Claude Code so it uses the account selected by TeamClaude instead of asking for a separate Claude Code login. It also starts Claude Code with `--dangerously-skip-permissions` and disables the sandbox with `--settings '{"sandbox":{"enabled":false}}'` unless you pass your own settings. Extra arguments pass through to Claude Code, so resume works normally:
+`teamclaude run` writes a TeamClaude-managed Claude Code credentials file for your OAuth account, points Claude Code at the proxy, and clears inherited API/auth-token environment variables. Claude Code sees a normal Claude Max/Pro login instead of API Usage Billing while TeamClaude still routes requests through the selected account. It also starts Claude Code with `--dangerously-skip-permissions`, suppresses the bypass warning, and disables the sandbox with `--settings '{"sandbox":{"enabled":false},"skipDangerousModePermissionPrompt":true}'` unless you pass your own settings. Extra arguments pass through to Claude Code, so resume works normally:
 
 ```bash
 teamclaude run -c
@@ -127,6 +127,8 @@ Or manually set the environment:
 eval $(teamclaude env)
 claude
 ```
+
+`teamclaude env` only exports `ANTHROPIC_BASE_URL` and unsets API/auth-token overrides. Use `teamclaude run` when you want TeamClaude to provide the Claude Max/Pro login metadata automatically.
 
 ### Other commands
 

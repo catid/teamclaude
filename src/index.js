@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
+import { copyFile, mkdir, readdir, symlink, writeFile, lstat, chmod } from 'node:fs/promises';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
 import { AccountManager } from './account-manager.js';
@@ -10,7 +13,17 @@ import { TUI } from './tui.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
-const DEFAULT_RUN_SETTINGS = JSON.stringify({ sandbox: { enabled: false } });
+const DEFAULT_RUN_SETTINGS = JSON.stringify({
+  sandbox: { enabled: false },
+  skipDangerousModePermissionPrompt: true,
+});
+const CLAUDE_CODE_SCOPES = [
+  'user:file_upload',
+  'user:inference',
+  'user:mcp_servers',
+  'user:profile',
+  'user:sessions:claude_code',
+];
 
 switch (command) {
   case 'server':
@@ -328,8 +341,10 @@ async function loginOAuthCommand() {
 async function envCommand() {
   const config = await loadOrCreateConfig();
   console.log(`export ANTHROPIC_BASE_URL=http://localhost:${config.proxy.port}`);
-  console.log(`export ANTHROPIC_AUTH_TOKEN=${config.proxy.apiKey}`);
   console.log('unset ANTHROPIC_API_KEY');
+  console.log('unset ANTHROPIC_AUTH_TOKEN');
+  console.log('unset CLAUDE_CODE_OAUTH_TOKEN');
+  console.log('unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN');
 }
 
 // ── run ─────────────────────────────────────────────────────
@@ -345,16 +360,25 @@ async function runCommand() {
   }
   claudeArgs.unshift('--dangerously-skip-permissions');
 
-  // Use the proxy key as a local Claude Code credential shim. The proxy still
-  // replaces client auth with the selected TeamClaude account before upstream.
   const proxyUrl = `http://localhost:${config.proxy.port}`;
-  const proxyKey = config.proxy.apiKey;
   const claudeEnv = {
     ...process.env,
     ANTHROPIC_BASE_URL: proxyUrl,
-    ANTHROPIC_AUTH_TOKEN: proxyKey,
   };
   delete claudeEnv.ANTHROPIC_API_KEY;
+  delete claudeEnv.ANTHROPIC_AUTH_TOKEN;
+  delete claudeEnv.CLAUDE_CODE_OAUTH_TOKEN;
+  delete claudeEnv.CLAUDE_CODE_OAUTH_REFRESH_TOKEN;
+
+  const oauthContext = await prepareClaudeCodeOAuthContext(config);
+  if (oauthContext) {
+    Object.assign(claudeEnv, oauthContext.env);
+  } else {
+    // API-key-only configurations still need a local credential for Claude Code.
+    // OAuth accounts use a generated Claude Code login file instead, so the UI
+    // remains in Claude Max/Pro mode instead of API Usage Billing.
+    claudeEnv.ANTHROPIC_AUTH_TOKEN = config.proxy.apiKey;
+  }
 
   // Use spawnSync so the Node process blocks entirely — behaves like execvp.
   const result = spawnSync('claude', claudeArgs, {
@@ -372,6 +396,166 @@ async function runCommand() {
   }
 
   process.exit(result.status ?? 1);
+}
+
+async function prepareClaudeCodeOAuthContext(config) {
+  const account = await selectRunOAuthAccount(config);
+  if (!account) return null;
+
+  await refreshRunAccountIfNeeded(config, account);
+  const profile = await fetchProfile(account.accessToken);
+  const profileOk = profile && !profile.error;
+
+  const configDir = await prepareClaudeCodeConfigDir();
+  const subscriptionType = account.subscriptionType
+    || subscriptionTypeFromProfile(profileOk ? profile : null);
+  const rateLimitTier = account.rateLimitTier
+    || (profileOk ? profile.rateLimitTier : null)
+    || defaultRateLimitTier(subscriptionType);
+
+  const credentials = {
+    claudeAiOauth: {
+      accessToken: account.accessToken,
+      // TeamClaude owns refresh. Leaving this blank prevents Claude Code from
+      // rotating the refresh token outside TeamClaude's config.
+      refreshToken: '',
+      expiresAt: account.expiresAt || 0,
+      scopes: CLAUDE_CODE_SCOPES,
+    },
+  };
+  if (subscriptionType) credentials.claudeAiOauth.subscriptionType = subscriptionType;
+  if (rateLimitTier) credentials.claudeAiOauth.rateLimitTier = rateLimitTier;
+
+  await writeFile(
+    join(configDir, '.credentials.json'),
+    JSON.stringify(credentials, null, 2) + '\n',
+    { mode: 0o600 }
+  );
+
+  const env = {
+    CLAUDE_CONFIG_DIR: configDir,
+  };
+  if (profileOk && profile.email) env.CLAUDE_CODE_USER_EMAIL = profile.email;
+  else if (account.name) env.CLAUDE_CODE_USER_EMAIL = account.name;
+  if (profileOk && profile.accountUuid) env.CLAUDE_CODE_ACCOUNT_UUID = profile.accountUuid;
+  else if (account.accountUuid) env.CLAUDE_CODE_ACCOUNT_UUID = account.accountUuid;
+  if (profileOk && profile.orgUuid) env.CLAUDE_CODE_ORGANIZATION_UUID = profile.orgUuid;
+  if (subscriptionType) env.CLAUDE_CODE_SUBSCRIPTION_TYPE = subscriptionType;
+  if (rateLimitTier) env.CLAUDE_CODE_RATE_LIMIT_TIER = rateLimitTier;
+
+  return { env, account, profile: profileOk ? profile : null };
+}
+
+async function selectRunOAuthAccount(config) {
+  const oauthAccounts = config.accounts.filter(a => a.type === 'oauth' && a.accessToken);
+  if (oauthAccounts.length === 0) return null;
+
+  const currentName = await getProxyCurrentAccountName(config);
+  if (currentName) {
+    const active = oauthAccounts.find(a => a.name === currentName);
+    if (active) return active;
+  }
+  return oauthAccounts[0];
+}
+
+async function getProxyCurrentAccountName(config) {
+  try {
+    const res = await fetch(`http://localhost:${config.proxy.port}/teamclaude/status`, {
+      headers: { 'x-api-key': config.proxy.apiKey },
+      signal: AbortSignal.timeout(300),
+    });
+    if (!res.ok) return null;
+    const status = await res.json();
+    return status.currentAccount || null;
+  } catch {
+    return null;
+  }
+}
+
+async function refreshRunAccountIfNeeded(config, account) {
+  if (!account.refreshToken || !isTokenExpiringSoon(account.expiresAt)) return;
+
+  const newTokens = await refreshAccessToken(account.refreshToken);
+  account.accessToken = newTokens.accessToken;
+  account.refreshToken = newTokens.refreshToken;
+  account.expiresAt = newTokens.expiresAt;
+  await saveConfig(config);
+}
+
+async function prepareClaudeCodeConfigDir() {
+  const configRoot = process.env.XDG_CONFIG_HOME || join(homedir(), '.config');
+  const configDir = process.env.TEAMCLAUDE_CLAUDE_CONFIG_DIR
+    || join(configRoot, 'teamclaude', 'claude-code');
+  await mkdir(configDir, { recursive: true, mode: 0o700 });
+  await chmod(configDir, 0o700).catch(() => {});
+
+  await seedClaudeJson(configDir);
+  await symlinkClaudeConfigEntries(configDir);
+  return configDir;
+}
+
+async function seedClaudeJson(configDir) {
+  const target = join(configDir, '.claude.json');
+  const source = join(homedir(), '.claude.json');
+  try {
+    await copyFile(source, target);
+    await chmod(target, 0o600).catch(() => {});
+    return;
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+
+  try {
+    await lstat(target);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    await writeFile(target, JSON.stringify({
+      numStartups: 1,
+      firstStartTime: new Date().toISOString(),
+      hasCompletedOnboarding: true,
+      lastOnboardingVersion: '1.0.17',
+      seenNotifications: {},
+    }, null, 2) + '\n', { mode: 0o600 });
+  }
+}
+
+async function symlinkClaudeConfigEntries(configDir) {
+  const sourceDir = join(homedir(), '.claude');
+  let entries;
+  try {
+    entries = await readdir(sourceDir);
+  } catch (err) {
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
+
+  for (const entry of entries) {
+    if (entry === '.credentials.json') continue;
+    const target = join(configDir, entry);
+    try {
+      await lstat(target);
+      continue;
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    try {
+      await symlink(join(sourceDir, entry), target);
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+    }
+  }
+}
+
+function subscriptionTypeFromProfile(profile) {
+  if (!profile) return null;
+  if (profile.hasClaudeMax || profile.orgType === 'claude_max') return 'max';
+  if (profile.hasClaudePro || profile.orgType === 'claude_pro') return 'pro';
+  return null;
+}
+
+function defaultRateLimitTier(subscriptionType) {
+  if (subscriptionType === 'max') return 'default_claude_max_20x';
+  return null;
 }
 
 // ── status ──────────────────────────────────────────────────
