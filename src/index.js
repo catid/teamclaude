@@ -8,7 +8,7 @@ import { createInterface } from 'node:readline';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath } from './config.js';
 import { AccountManager } from './account-manager.js';
 import { createProxyServer } from './server.js';
-import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
+import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon, normalizeExpiresAt } from './oauth.js';
 import { TUI } from './tui.js';
 
 const args = process.argv.slice(2);
@@ -24,6 +24,13 @@ const CLAUDE_CODE_SCOPES = [
   'user:profile',
   'user:sessions:claude_code',
 ];
+
+class RunAuthError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'RunAuthError';
+  }
+}
 
 switch (command) {
   case 'server':
@@ -370,7 +377,16 @@ async function runCommand() {
   delete claudeEnv.CLAUDE_CODE_OAUTH_TOKEN;
   delete claudeEnv.CLAUDE_CODE_OAUTH_REFRESH_TOKEN;
 
-  const oauthContext = await prepareClaudeCodeOAuthContext(config);
+  let oauthContext;
+  try {
+    oauthContext = await prepareClaudeCodeOAuthContext(config);
+  } catch (err) {
+    if (err instanceof RunAuthError) {
+      console.error(err.message);
+      process.exit(1);
+    }
+    throw err;
+  }
   if (oauthContext) {
     Object.assign(claudeEnv, oauthContext.env);
   } else {
@@ -402,7 +418,6 @@ async function prepareClaudeCodeOAuthContext(config) {
   const account = await selectRunOAuthAccount(config);
   if (!account) return null;
 
-  await refreshRunAccountIfNeeded(config, account);
   const profile = await fetchProfile(account.accessToken);
   const profileOk = profile && !profile.error;
 
@@ -450,12 +465,31 @@ async function selectRunOAuthAccount(config) {
   const oauthAccounts = config.accounts.filter(a => a.type === 'oauth' && a.accessToken);
   if (oauthAccounts.length === 0) return null;
 
+  const orderedAccounts = [];
   const currentName = await getProxyCurrentAccountName(config);
   if (currentName) {
     const active = oauthAccounts.find(a => a.name === currentName);
-    if (active) return active;
+    if (active) orderedAccounts.push(active);
   }
-  return oauthAccounts[0];
+  for (const account of oauthAccounts) {
+    if (!orderedAccounts.includes(account)) orderedAccounts.push(account);
+  }
+
+  const failures = [];
+  for (const account of orderedAccounts) {
+    const result = await refreshRunAccountIfNeeded(config, account);
+    if (result.ok) return account;
+    failures.push(`  - ${account.name}: ${result.reason}`);
+  }
+
+  throw new RunAuthError([
+    'No usable TeamClaude OAuth account is available for Claude Code.',
+    '',
+    ...failures,
+    '',
+    'The stored login on this machine is expired or revoked.',
+    'Run `teamclaude login`, then restart the TeamClaude server with `./run-team-servers.sh` or press `R` in the teamclaude-server TUI.',
+  ].join('\n'));
 }
 
 async function getProxyCurrentAccountName(config) {
@@ -473,13 +507,46 @@ async function getProxyCurrentAccountName(config) {
 }
 
 async function refreshRunAccountIfNeeded(config, account) {
-  if (!account.refreshToken || !isTokenExpiringSoon(account.expiresAt)) return;
+  if (!isTokenExpiringSoon(account.expiresAt)) return { ok: true };
+  if (!account.refreshToken) {
+    return { ok: false, reason: 'access token is expired or expiring and no refresh token is stored' };
+  }
 
-  const newTokens = await refreshAccessToken(account.refreshToken);
-  account.accessToken = newTokens.accessToken;
-  account.refreshToken = newTokens.refreshToken;
-  account.expiresAt = newTokens.expiresAt;
-  await saveConfig(config);
+  try {
+    const newTokens = await refreshAccessToken(account.refreshToken);
+    account.accessToken = newTokens.accessToken;
+    account.refreshToken = newTokens.refreshToken;
+    account.expiresAt = newTokens.expiresAt;
+    await saveConfig(config);
+    return { ok: true };
+  } catch (err) {
+    const reason = summarizeRefreshError(err);
+    if (!isInvalidGrant(err) && !isAccessTokenExpired(account.expiresAt)) {
+      console.error(`[TeamClaude] Could not refresh "${account.name}" before launch (${reason}); using the current access token.`);
+      return { ok: true };
+    }
+    return { ok: false, reason };
+  }
+}
+
+function isAccessTokenExpired(expiresAt) {
+  const normalized = normalizeExpiresAt(expiresAt);
+  return normalized ? Date.now() >= normalized : false;
+}
+
+function isInvalidGrant(err) {
+  return (err?.message || String(err)).includes('invalid_grant');
+}
+
+function summarizeRefreshError(err) {
+  const message = err?.message || String(err);
+  if (message.includes('invalid_grant')) {
+    return 'stored refresh token is invalid or revoked';
+  }
+  if (message.includes('Token refresh failed')) {
+    return message.replace(/\s+/g, ' ').slice(0, 300);
+  }
+  return message;
 }
 
 async function prepareClaudeCodeConfigDir() {
