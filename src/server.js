@@ -8,6 +8,8 @@ const HOP_BY_HOP_HEADERS = new Set([
   'te', 'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
 ]);
 
+const DEFAULT_429_BACKOFF_SECONDS = 60;
+
 export function createProxyServer(accountManager, config, hooks = {}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const proxyApiKey = config.proxy?.apiKey;
@@ -247,21 +249,26 @@ async function forwardRequest(req, res, body, accountManager, upstream, retryCou
     }
     accountManager.updateQuota(account.index, rateLimitHeaders);
 
-    // On 429, wait the retry-after duration and retry on the same account
-    // (this is a transient rate limit, not quota exhaustion)
+    // On 429, mark this account throttled and rotate immediately. Sleeping
+    // inside the proxy holds Claude Code's connection open and causes apparent
+    // hangs when an account starts returning long retry-after windows.
     if (upstreamRes.status === 429) {
-      const retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10) || 60;
-      // Discard the 429 response body
+      const retryAfter = parseRetryAfterSeconds(upstreamRes.headers.get('retry-after'));
       await upstreamRes.body?.cancel();
 
+      const backoffSecs = computeAccountRetryAfter(account, retryAfter ?? DEFAULT_429_BACKOFF_SECONDS);
+      accountManager.markRateLimited(account.index, backoffSecs);
+
       if (logDir) {
-        logSections.push(`=== RESPONSE 429 — waiting ${retryAfter}s ===\n${formatHeaders(upstreamRes.headers)}`);
+        logSections.push(`=== RESPONSE 429 — backoff ${backoffSecs}s, switching account ===\n${formatHeaders(upstreamRes.headers)}`);
+        writeRequestLog(logDir, reqId, logSections);
       }
-      console.log(`[TeamClaude] 429 on "${account.name}" — waiting ${retryAfter}s before retry`);
-      await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
-      // Client may have disconnected during the wait
-      if (res.destroyed) return;
-      return forwardRequest(req, res, body, accountManager, upstream, retryCount, hooks, reqId, ctx, logDir);
+      console.log(`[TeamClaude] 429 on "${account.name}" — backing off ${backoffSecs}s and switching account`);
+      if (retryCount < maxRetries) {
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir);
+      }
+      ctx.status = 429;
+      return writeAllAccountsRateLimited(res, accountManager);
     }
 
     // Log response headers
@@ -358,6 +365,56 @@ function getBearerToken(value) {
   return match?.[1] || null;
 }
 
+function parseRetryAfterSeconds(value) {
+  if (!value) return null;
+
+  const seconds = Number.parseInt(value, 10);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds);
+
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return null;
+
+  return Math.max(0, Math.ceil((timestamp - Date.now()) / 1000));
+}
+
+function parseResetTime(value) {
+  if (!value) return null;
+  if (typeof value === 'number') return value;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function computeAccountRetryAfter(account, fallbackSeconds) {
+  const now = Date.now();
+  const resets = [
+    account.rateLimitedUntil,
+    account.quota?.unified5hReset,
+    account.quota?.unified7dReset,
+    account.quota?.resetsAt,
+  ]
+    .map(parseResetTime)
+    .filter(reset => reset && reset > now);
+
+  if (resets.length === 0) return fallbackSeconds;
+  return Math.max(1, Math.ceil((Math.min(...resets) - now) / 1000));
+}
+
+function writeAllAccountsRateLimited(res, accountManager) {
+  const status = accountManager.getStatus();
+  const retryAfter = computeRetryAfter(status.accounts);
+  res.writeHead(429, {
+    'Content-Type': 'application/json',
+    'retry-after': String(retryAfter),
+  });
+  res.end(JSON.stringify({
+    type: 'error',
+    error: {
+      type: 'rate_limit_error',
+      message: `All ${accountManager.accounts.length} accounts exhausted. Retry in ${retryAfter}s.`,
+    },
+  }));
+}
+
 /**
  * Stream an SSE response to the client, parsing usage data along the way.
  */
@@ -443,10 +500,19 @@ function extractUsageFromBody(buffer, accountIndex, accountManager) {
 function computeRetryAfter(accounts) {
   let soonest = Infinity;
   for (const acct of accounts) {
-    const reset = acct.rateLimitedUntil || acct.quota.resetsAt;
-    if (reset) {
-      const ms = new Date(reset).getTime() - Date.now();
-      if (ms < soonest) soonest = ms;
+    const resets = [
+      acct.rateLimitedUntil,
+      acct.quota.unified5hReset,
+      acct.quota.unified7dReset,
+      acct.quota.resetsAt,
+    ];
+
+    for (const resetValue of resets) {
+      const reset = parseResetTime(resetValue);
+      if (reset) {
+        const ms = reset - Date.now();
+        if (ms > 0 && ms < soonest) soonest = ms;
+      }
     }
   }
   return soonest === Infinity ? 60 : Math.max(1, Math.ceil(soonest / 1000));

@@ -17,6 +17,32 @@ function emptyQuota() {
   };
 }
 
+function parseResetTime(value) {
+  if (!value) return null;
+  if (typeof value === 'number') return value;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function soonestFutureReset(...values) {
+  const now = Date.now();
+  let soonest = null;
+
+  for (const value of values) {
+    const reset = parseResetTime(value);
+    if (reset && reset > now && (soonest == null || reset < soonest)) {
+      soonest = reset;
+    }
+  }
+
+  return soonest;
+}
+
+function secondsUntil(timestamp, fallbackSeconds = 60) {
+  if (!timestamp) return fallbackSeconds;
+  return Math.max(1, Math.ceil((timestamp - Date.now()) / 1000));
+}
+
 export class AccountManager {
   constructor(accounts, switchThreshold = 0.98) {
     this.accounts = accounts.map((acct, index) => ({
@@ -97,6 +123,7 @@ export class AccountManager {
     }
 
     // Unified quotas (Claude Max) — utilization is already 0-1
+    if (q.unifiedStatus === 'rejected') return true;
     if (q.unified5h != null && q.unified5h >= this.switchThreshold) return true;
     if (q.unified7d != null && q.unified7d >= this.switchThreshold) return true;
 
@@ -194,6 +221,16 @@ export class AccountManager {
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
+
+    if (account.quota.unifiedStatus === 'rejected') {
+      const reset = soonestFutureReset(
+        account.quota.unified5hReset,
+        account.quota.unified7dReset,
+        account.quota.resetsAt,
+      );
+      this.markRateLimited(accountIndex, secondsUntil(reset));
+      return;
+    }
 
     // Log when approaching quota
     if (this._isNearQuota(account)) {
